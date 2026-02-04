@@ -64,6 +64,14 @@ int main(int argc, char** argv) {
     perror("sigaction");
     return 1;
   }
+  if (sigaction(SIGBUS, &sa, 0) != 0) {
+    perror("sigaction");
+    return 1;
+  }
+  if (sigaction(SIGILL, &sa, 0) != 0) {
+    perror("sigaction");
+    return 1;
+  }
 
   const char* path = argv[1];
   int fd = open(path, O_RDONLY);

@@ -31,5 +31,6 @@ $(RUNNER_BIN): testdata/runner/runner.c $(ZIG_CACHE_DIR)
 
 clean:
 	rm -f $(BIN) $(RUNNER_BIN)
+	rm -f runner payload.bin
 	rm -rf $(GO_CACHE_DIR) $(ZIG_CACHE_DIR)
 

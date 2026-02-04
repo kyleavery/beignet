@@ -2,8 +2,8 @@
 payload.bin
 .DS_Store
 /.go-cache
+/.go-modcache
 /.zig-cache
 /testdata/runner/runner
 /runner
 *.dylib
-
