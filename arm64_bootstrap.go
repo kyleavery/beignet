@@ -1,6 +1,50 @@
 package beignet
 
-import "encoding/binary"
+import (
+	"fmt"
+	"strings"
+	"sync"
+
+	keystone "github.com/moloch--/go-keystone"
+)
+
+const arm64BootstrapLen = 21 * 4
+
+var (
+	arm64KeystoneOnce sync.Once
+	arm64KeystoneEng  *keystone.Engine
+	arm64KeystoneErr  error
+	arm64KeystoneMu   sync.Mutex
+)
+
+func arm64Assembler() (*keystone.Engine, error) {
+	arm64KeystoneOnce.Do(func() {
+		arm64KeystoneEng, arm64KeystoneErr = keystone.NewEngine(keystone.ARCH_ARM64, keystone.MODE_LITTLE_ENDIAN)
+	})
+	return arm64KeystoneEng, arm64KeystoneErr
+}
+
+func assembleArm64(src string) ([]byte, error) {
+	eng, err := arm64Assembler()
+	if err != nil {
+		return nil, err
+	}
+	arm64KeystoneMu.Lock()
+	defer arm64KeystoneMu.Unlock()
+	return eng.Assemble(src, 0)
+}
+
+func emitMovImm64(sb *strings.Builder, reg string, imm uint64) {
+	lo := uint16(imm & 0xffff)
+	m16 := uint16((imm >> 16) & 0xffff)
+	m32 := uint16((imm >> 32) & 0xffff)
+	m48 := uint16((imm >> 48) & 0xffff)
+
+	fmt.Fprintf(sb, "movz %s, #0x%X\n", reg, lo)
+	fmt.Fprintf(sb, "movk %s, #0x%X, lsl #16\n", reg, m16)
+	fmt.Fprintf(sb, "movk %s, #0x%X, lsl #32\n", reg, m32)
+	fmt.Fprintf(sb, "movk %s, #0x%X, lsl #48\n", reg, m48)
+}
 
 // buildArm64Bootstrap returns a small aarch64 stub which:
 // - sets x0 = base + payloadOffset
@@ -9,73 +53,32 @@ import "encoding/binary"
 // - jumps to base + loaderEntryOffsetAbs using br
 //
 // The loader expects payload pointer/size in x0/x1 and the entry symbol pointer in x2.
-func buildArm64Bootstrap(payloadOffset, payloadSize, symbolOffset, loaderEntryOffsetAbs uint64) []byte {
-	var out []byte
+func buildArm64Bootstrap(payloadOffset, payloadSize, symbolOffset, loaderEntryOffsetAbs uint64) ([]byte, error) {
+	var sb strings.Builder
+	sb.Grow(512)
 
-	// adr x9, #0
-	out = appendU32LE(out, encADR(9, 0))
+	sb.WriteString("adr x9, #0\n")
 
-	// x0 = base + payloadOffset
-	out = appendMovImm64X(out, 0, payloadOffset)
-	out = appendU32LE(out, encADDRegX(0, 0, 9))
+	emitMovImm64(&sb, "x0", payloadOffset)
+	sb.WriteString("add x0, x0, x9\n")
 
-	// x1 = payloadSize
-	out = appendMovImm64X(out, 1, payloadSize)
+	emitMovImm64(&sb, "x1", payloadSize)
 
-	// x2 = base + symbolOffset
-	out = appendMovImm64X(out, 2, symbolOffset)
-	out = appendU32LE(out, encADDRegX(2, 2, 9))
+	emitMovImm64(&sb, "x2", symbolOffset)
+	sb.WriteString("add x2, x2, x9\n")
 
-	// x16 = base + loaderEntryOffsetAbs
-	out = appendMovImm64X(out, 16, loaderEntryOffsetAbs)
-	out = appendU32LE(out, encADDRegX(16, 16, 9))
+	emitMovImm64(&sb, "x16", loaderEntryOffsetAbs)
+	sb.WriteString("add x16, x16, x9\n")
 
-	// br x16
-	out = appendU32LE(out, encBR(16))
+	sb.WriteString("br x16\n")
 
-	return out
+	b, err := assembleArm64(sb.String())
+	if err != nil {
+		return nil, err
+	}
+	if len(b) != arm64BootstrapLen {
+		return nil, fmt.Errorf("beignet: unexpected bootstrap length: got=%d want=%d", len(b), arm64BootstrapLen)
+	}
+	return b, nil
 }
 
-func appendMovImm64X(out []byte, rd uint8, imm uint64) []byte {
-	out = appendU32LE(out, encMOVZX(rd, uint16(imm&0xffff), 0))
-	out = appendU32LE(out, encMOVKX(rd, uint16((imm>>16)&0xffff), 16))
-	out = appendU32LE(out, encMOVKX(rd, uint16((imm>>32)&0xffff), 32))
-	out = appendU32LE(out, encMOVKX(rd, uint16((imm>>48)&0xffff), 48))
-	return out
-}
-
-func appendU32LE(out []byte, v uint32) []byte {
-	var b [4]byte
-	binary.LittleEndian.PutUint32(b[:], v)
-	return append(out, b[:]...)
-}
-
-// ADR (immediate).
-// Base opcode 0x10000000. imm is a signed 21-bit byte offset.
-func encADR(rd uint8, imm int32) uint32 {
-	immlo := uint32(imm) & 0x3
-	immhi := (uint32(imm) >> 2) & 0x7ffff
-	return 0x10000000 | (immlo << 29) | (immhi << 5) | uint32(rd)
-}
-
-// MOVZ Xd, imm16, LSL shift
-func encMOVZX(rd uint8, imm16 uint16, shift uint8) uint32 {
-	hw := uint32(shift / 16)
-	return 0xD2800000 | (hw << 21) | (uint32(imm16) << 5) | uint32(rd)
-}
-
-// MOVK Xd, imm16, LSL shift
-func encMOVKX(rd uint8, imm16 uint16, shift uint8) uint32 {
-	hw := uint32(shift / 16)
-	return 0xF2800000 | (hw << 21) | (uint32(imm16) << 5) | uint32(rd)
-}
-
-// ADD Xd, Xn, Xm (shifted register), shift=LSL #0
-func encADDRegX(rd, rn, rm uint8) uint32 {
-	return 0x8B000000 | (uint32(rm) << 16) | (uint32(rn) << 5) | uint32(rd)
-}
-
-// BR Xn
-func encBR(rn uint8) uint32 {
-	return 0xD61F0000 | (uint32(rn) << 5)
-}

@@ -48,7 +48,10 @@ func DylibToShellcode(dylib []byte, opts Options) ([]byte, error) {
 		return nil, err
 	}
 
-	bootstrap := buildArm64Bootstrap(0, 0, 0, 0)
+	bootstrap, err := buildArm64Bootstrap(0, 0, 0, 0)
+	if err != nil {
+		return nil, fmt.Errorf("beignet: assemble arm64 bootstrap: %w", err)
+	}
 	// The embedded loader is a (mostly) position-independent Mach-O image blob.
 	// It expects to start at a page boundary so ADRP-based addressing remains valid.
 	//
@@ -63,7 +66,10 @@ func DylibToShellcode(dylib []byte, opts Options) ([]byte, error) {
 	payloadSize := uint64(len(dylib))
 	entrySymbolStart := payloadStart + payloadSize
 
-	bootstrap = buildArm64Bootstrap(payloadStart, payloadSize, entrySymbolStart, loaderEntryAbs)
+	bootstrap, err = buildArm64Bootstrap(payloadStart, payloadSize, entrySymbolStart, loaderEntryAbs)
+	if err != nil {
+		return nil, fmt.Errorf("beignet: assemble arm64 bootstrap: %w", err)
+	}
 
 	out := make([]byte, 0, int(entrySymbolStart)+len(entrySymbol)+1)
 	out = append(out, bootstrap...)
