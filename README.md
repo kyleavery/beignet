@@ -1,6 +1,6 @@
 # Beignet
 
-Converts .dylib files to MacOS shellcode, use as a CLI or import as a golang library.
+[Donut](github.com/sliverarmory/wasm-donut) for MacOS, converts .dylib files into MacOS PIC shellcode, can be used as a CLI or imported as a golang library.
 
 ### CLI
 
