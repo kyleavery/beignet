@@ -82,11 +82,22 @@ jobs:
         uses: actions/download-artifact@v5
         with:
           name: stager-darwin-arm64
-          path: .
+          path: .stager-artifact
 
-      - name: Verify stager
+      - name: Install stager
         run: |
           set -euo pipefail
+          rm -f internal/stager/stager_darwin_arm64.bin internal/stager/stager_darwin_arm64.go
+
+          bin_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.bin' -print -quit)"
+          go_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.go' -print -quit)"
+
+          test -n "${bin_path}"
+          test -n "${go_path}"
+
+          cp "${bin_path}" internal/stager/stager_darwin_arm64.bin
+          cp "${go_path}" internal/stager/stager_darwin_arm64.go
+
           test -f internal/stager/stager_darwin_arm64.bin
           test -f internal/stager/stager_darwin_arm64.go
 
