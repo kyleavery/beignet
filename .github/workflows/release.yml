@@ -1,0 +1,152 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_VERSION: ${{ github.ref_name }}
+  BINARY_NAME: beignet
+
+jobs:
+  genstager:
+    name: Generate stager (darwin/arm64)
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Check Out Code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install Zig
+        run: brew install zig
+
+      - name: Generate embedded loader
+        run: go generate ./internal/stager
+
+      - name: Verify stager
+        run: |
+          set -euo pipefail
+          test -f internal/stager/stager_darwin_arm64.bin
+          test -f internal/stager/stager_darwin_arm64.go
+
+      - name: Upload stager
+        uses: actions/upload-artifact@v4
+        with:
+          name: stager-darwin-arm64
+          path: |
+            internal/stager/stager_darwin_arm64.bin
+            internal/stager/stager_darwin_arm64.go
+          if-no-files-found: error
+          retention-days: 5
+
+  darwin-builds:
+    name: macOS Builds
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs: genstager
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        goos: [darwin]
+        goarch: [arm64]
+
+    steps:
+      - name: Check Out Code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Download stager
+        uses: actions/download-artifact@v5
+        with:
+          name: stager-darwin-arm64
+          path: .
+
+      - name: Verify stager
+        run: |
+          set -euo pipefail
+          test -f internal/stager/stager_darwin_arm64.bin
+          test -f internal/stager/stager_darwin_arm64.go
+
+      - name: Go Build
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          output="dist/${BINARY_NAME}_${{ matrix.goos }}-${{ matrix.goarch }}"
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build \
+            -trimpath \
+            -ldflags "-s -w" \
+            -o "${output}" \
+            ./cli
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/${{ env.BINARY_NAME }}_${{ matrix.goos }}-${{ matrix.goarch }}
+          if-no-files-found: error
+          retention-days: 5
+
+  tagged-release:
+    name: Tagged Release
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs:
+      - genstager
+      - darwin-builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check Out Code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Collect Artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: release
+          pattern: build-*
+          merge-multiple: true
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ env.RELEASE_VERSION }}
+        run: |
+          set -euo pipefail
+          mapfile -t release_files < <(find release -type f -print)
+          if [ ${#release_files[@]} -eq 0 ]; then
+            echo "No release artifacts found in release/" >&2
+            exit 1
+          fi
+
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" "${release_files[@]}" --clobber
+          else
+            gh release create "${TAG_NAME}" \
+              --title "${TAG_NAME}" \
+              --generate-notes \
+              "${release_files[@]}"
+          fi
