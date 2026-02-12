@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/kyleavery/beignet"
+	"github.com/sliverarmory/beignet"
 )
 
 const markerPath = "/tmp/beignet_test_marker"

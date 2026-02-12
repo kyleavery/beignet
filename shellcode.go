@@ -8,8 +8,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/kyleavery/beignet/internal/aplib"
-	"github.com/kyleavery/beignet/internal/stager"
+	"github.com/sliverarmory/beignet/internal/aplib"
+	"github.com/sliverarmory/beignet/internal/stager"
 )
 
 const (
@@ -58,13 +58,11 @@ func DylibToShellcode(dylib []byte, opts Options) ([]byte, error) {
 	}
 
 	loaderText, loaderEntryOff, err := stager.LoaderText()
-	fmt.Printf("loaderText size: %d bytes, entry offset: 0x%x\n", len(loaderText), loaderEntryOff)
 	if err != nil {
 		return nil, err
 	}
 
 	bootstrap, err := buildArm64Bootstrap(0, 0, 0, 0)
-	fmt.Printf("bootstrap size: %d bytes\n", len(bootstrap))
 	if err != nil {
 		return nil, fmt.Errorf("beignet: assemble arm64 bootstrap: %w", err)
 	}
@@ -75,24 +73,17 @@ func DylibToShellcode(dylib []byte, opts Options) ([]byte, error) {
 	// so we just need to align the loader start offset.
 	const loaderAlign = 0x1000
 	loaderStart := alignUp(uint64(len(bootstrap)), loaderAlign)
-	fmt.Printf("loaderStart offset: 0x%x\n", loaderStart)
 	loaderPad := int(loaderStart - uint64(len(bootstrap)))
-	fmt.Printf("loaderPad size: %d bytes\n", loaderPad)
 	loaderEntryAbs := loaderStart + loaderEntryOff
-	fmt.Printf("loaderEntry absolute offset: 0x%x\n", loaderEntryAbs)
 
 	payloadStart := alignUp(loaderStart+uint64(len(loaderText)), 16)
-	fmt.Printf("payloadStart offset: 0x%x\n", payloadStart)
 	payloadSize := uint64(len(payload))
-	fmt.Printf("payload size: %d bytes\n", payloadSize)
 	entrySymbolStart := payloadStart + payloadSize
-	fmt.Printf("entrySymbolStart offset: 0x%x\n", entrySymbolStart)
 
 	bootstrap, err = buildArm64Bootstrap(payloadStart, payloadSize, entrySymbolStart, loaderEntryAbs)
 	if err != nil {
 		return nil, fmt.Errorf("beignet: assemble arm64 bootstrap: %w", err)
 	}
-	fmt.Printf("final bootstrap size: %d bytes\n", len(bootstrap))
 
 	out := make([]byte, 0, int(entrySymbolStart)+len(entrySymbol)+1)
 	out = append(out, bootstrap...)

@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/kyleavery/beignet"
+	"github.com/sliverarmory/beignet"
 	"github.com/spf13/cobra"
 )
 
