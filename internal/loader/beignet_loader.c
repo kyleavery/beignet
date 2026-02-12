@@ -128,8 +128,7 @@ struct Region
 struct ArrayOfRegions
 {
   struct Region* _elements;
-  uintptr_t _allocCount;
-  uintptr_t _usedCount;
+  uintptr_t _count;
 };
 
 struct ArrayOfLoaderPointers
@@ -239,7 +238,6 @@ typedef void* (*JustInTimeLoaderMake2_ptr)(void* apis, void* ma, const char* pat
                                           uint64_t sliceOffset, bool willNeverUnload, bool leaveMapped, bool overridesCache,
                                           uint16_t overridesDylibIndex, const void* layout);
 typedef void* (*AnalyzeSegmentsLayout_ptr)(void* ma, uintptr_t* vmSpace, bool* hasZeroFill);
-typedef void* (*WithRegions_ptr)(void* ma, void* callback);
 typedef void* (*MMap_ptr)(void* sdg, void* addr, size_t length, int prot, int flags, int fd, uint64_t offset);
 typedef void* (*Mprotect_ptr)(void* sdg, void* dst, uint64_t length, int prot);
 typedef void (*LoadDependents_ptr)(void* topLoader, const struct diagnostics* diag, void* apis, const struct LoadOptions* lo);
@@ -258,6 +256,14 @@ typedef struct LockGuardRet (*LockGuard_ptr)(void* mm);
 typedef void (*WriteProtect_ptr)(void* mm, bool protect);
 typedef void (*LockUnlock_ptr)(void* lock);
 typedef void (*WithProtectedStack_ptr)(void* protectedStack, void (^callback)(void));
+
+static int normalize_segment_prot(int perms)
+{
+  if (perms & PROT_EXEC) {
+    return PROT_READ | PROT_EXEC;
+  }
+  return PROT_READ | PROT_WRITE;
+}
 
 static int string_compare(const char* s1, const char* s2)
 {
@@ -772,8 +778,6 @@ __attribute__((used, noinline)) int beignet_loader(void* buffer_ro, uint64_t buf
       (WithVMLayout_ptr)find_symbol(dyld, "__ZNK5dyld313MachOAnalyzer12withVMLayoutER11DiagnosticsU13block_pointerFvRKN6mach_o6LayoutEE", slide);
   AnalyzeSegmentsLayout_ptr AnalyzeSegmentsLayout_func =
       (AnalyzeSegmentsLayout_ptr)find_symbol(dyld, "__ZNK5dyld39MachOFile21analyzeSegmentsLayoutERyRb", slide);
-  WithRegions_ptr WithRegions_func = (WithRegions_ptr)find_symbol(
-      dyld, "__ZN5dyld416JustInTimeLoader11withRegionsEPKN5dyld39MachOFileEU13block_pointerFvRKNS1_5ArrayINS_6Loader6RegionEEEE", slide);
   LoadDependents_ptr LoadDependents_func =
       (LoadDependents_ptr)find_symbol(dyld, "__ZN5dyld46Loader14loadDependentsER11DiagnosticsRNS_12RuntimeStateERKNS0_11LoadOptionsE", slide);
   NotifyDebuggerLoad_ptr NotifyDebuggerLoad_func = (NotifyDebuggerLoad_ptr)find_symbol(
@@ -795,7 +799,7 @@ __attribute__((used, noinline)) int beignet_loader(void* buffer_ro, uint64_t buf
   HandleFromLoader_ptr HandleFromLoader_func =
       (HandleFromLoader_ptr)find_symbol(dyld, "__ZN5dyld4L16handleFromLoaderEPKNS_6LoaderEb", slide);
 
-  if (!MMap_func || !Mprotect_func || !JustInTimeLoaderMake2_func || !WithVMLayout_func || !AnalyzeSegmentsLayout_func || !WithRegions_func ||
+  if (!MMap_func || !Mprotect_func || !JustInTimeLoaderMake2_func || !WithVMLayout_func || !AnalyzeSegmentsLayout_func ||
       !LoadDependents_func || !NotifyDebuggerLoad_func || !AddWeakDefs_func || !ApplyFixups_func || !NotifyDtrace_func ||
       !RebindMissingFlatLazySymbols_func || !IncDlRefCount_func || !NotifyLoad_func || !RunInitializers_func ||
       !HandleFromLoader_func) {
@@ -841,7 +845,7 @@ __attribute__((used, noinline)) int beignet_loader(void* buffer_ro, uint64_t buf
         return 14;
       }
 
-      void* depacked = MMap_func(sdg, 0, (size_t)origSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+      void* depacked = MMap_func(sdg, 0, (size_t)origSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
       if (depacked == (void*)-1 || depacked == 0) {
         return 15;
       }
@@ -865,38 +869,82 @@ __attribute__((used, noinline)) int beignet_loader(void* buffer_ro, uint64_t buf
     return 5;
   }
 
-  void* loadAddressP = MMap_func(sdg, 0, (size_t)vmSpace, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  void* loadAddressP = MMap_func(sdg, 0, (size_t)vmSpace, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
   if (loadAddressP == (void*)-1 || loadAddressP == 0) {
     return 6;
   }
   uintptr_t loadAddress = (uintptr_t)loadAddressP;
 
-  // Map segments into the reserved space.
-  WithRegions_func((void*)buffer, ^(struct ArrayOfRegions* rptr) {
-    uint32_t segIndex = 0;
-    uint64_t sliceOffset = 0;
-    for (int i = 0; i < (int)rptr->_usedCount; i++) {
-      const struct Region region = rptr->_elements[i];
-      if (region.isZeroFill || (region.fileSize == 0)) {
-        continue;
-      }
-      if ((region.vmOffset == 0) && (segIndex > 0)) {
-        continue;
-      }
-      int perms = (int)region.perms;
-      void* segAddress = MMap_func(sdg, (void*)(loadAddress + region.vmOffset), (size_t)region.fileSize, PROT_WRITE,
-                                  MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
-      if (segAddress == (void*)-1 || segAddress == 0) {
-        continue;
-      }
-      memcpy2(segAddress, (const void*)(buffer + sliceOffset + region.fileOffset), (size_t)region.fileSize);
-      Mprotect_func(sdg, segAddress, (uint64_t)region.fileSize, perms);
-      ++segIndex;
+  if (bufferLen < sizeof(struct mach_header_64)) {
+    return 5;
+  }
+  const struct mach_header_64* mh = (const struct mach_header_64*)(uintptr_t)buffer;
+  if (mh->magic != MH_MAGIC_64 || mh->sizeofcmds > (bufferLen - sizeof(struct mach_header_64))) {
+    return 5;
+  }
+
+  const struct load_command* lc = (const struct load_command*)(mh + 1);
+  uint64_t lcOffset = sizeof(struct mach_header_64);
+  uint64_t headerVmAddr = 0;
+  bool foundHeaderSegment = false;
+  for (uint32_t i = 0; i < mh->ncmds; i++) {
+    if (lc->cmdsize < sizeof(struct load_command) || (lcOffset + lc->cmdsize) > bufferLen) {
+      return 5;
     }
-  });
+    if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
+      const struct segment_command_64* seg = (const struct segment_command_64*)lc;
+      if (seg->fileoff == 0 && seg->filesize != 0) {
+        headerVmAddr = seg->vmaddr;
+        foundHeaderSegment = true;
+      }
+    }
+    lc = (const struct load_command*)((const char*)lc + lc->cmdsize);
+    lcOffset += lc->cmdsize;
+  }
+  if (!foundHeaderSegment) {
+    return 5;
+  }
+
+  lc = (const struct load_command*)(mh + 1);
+  lcOffset = sizeof(struct mach_header_64);
+  uint32_t segIndex = 0;
+  for (uint32_t i = 0; i < mh->ncmds; i++) {
+    if (lc->cmdsize < sizeof(struct load_command) || (lcOffset + lc->cmdsize) > bufferLen) {
+      return 5;
+    }
+
+    if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
+      const struct segment_command_64* seg = (const struct segment_command_64*)lc;
+      if (seg->filesize != 0) {
+        if (seg->vmaddr < headerVmAddr || seg->filesize > seg->vmsize || (seg->fileoff + seg->filesize) > bufferLen) {
+          return 5;
+        }
+        uint64_t vmOffset = seg->vmaddr - headerVmAddr;
+        if ((vmOffset + seg->vmsize) > vmSpace) {
+          return 5;
+        }
+
+        void* segAddress = (void*)(loadAddress + vmOffset);
+
+        memcpy2(segAddress, (const void*)(buffer + seg->fileoff), (size_t)seg->filesize);
+
+        int perms = normalize_segment_prot((int)seg->initprot);
+        if (seg->vmsize != 0) {
+          Mprotect_func(sdg, (void*)(loadAddress + vmOffset), (uint64_t)seg->vmsize, perms);
+        }
+        ++segIndex;
+      }
+    }
+
+    lc = (const struct load_command*)((const char*)lc + lc->cmdsize);
+    lcOffset += lc->cmdsize;
+  }
+  if (segIndex == 0) {
+    return 5;
+  }
 
   // Scratch space for dyld4 structs (avoid __block).
-  void* structspaceP = MMap_func(sdg, 0, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  void* structspaceP = MMap_func(sdg, 0, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
   if (structspaceP == (void*)-1 || structspaceP == 0) {
     return 7;
   }
@@ -1040,8 +1088,9 @@ __attribute__((used, noinline)) int beignet_loader(void* buffer_ro, uint64_t buf
     return 13;
   }
 
-  void (*entry_func)(void) = (void (*)(void))addr_entry;
-  entry_func();
+  
+  void (*entry_func)(void*) = (void (*)(void*))addr_entry;
+  entry_func(NULL);
 
   return 0;
 }
