@@ -1,4 +1,4 @@
-module github.com/sliverarmory/beignet
+module github.com/kyleavery/beignet
 
 go 1.25.6
 
